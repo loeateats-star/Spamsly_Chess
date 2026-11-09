@@ -755,8 +755,13 @@ DRILL_REPS = 3
 # A correct answer at level 4 (1 week) or higher forgives one miss.
 LAPSE_FACTOR = 0.6
 MAX_LAPSE_EFFECT = 4
-MIN_INTERVAL = HOUR
+MIN_INTERVAL = 3 * HOUR
 FORGIVE_FROM_LEVEL = 4
+# A move you play correctly while reviewing a line counts as reviewed once at least this
+# fraction of its interval has passed, so all moves of a line stay on one shared timer
+# instead of each coming due at a slightly different time (which made the same lines
+# come back over and over).
+EARLY_REVIEW = 0.5
 
 
 def interval_for(level, lapses):
@@ -849,9 +854,10 @@ class Progress:
         lvl, due = self.get(key)
         if lvl == 0:
             self.learn(key, now)
-        elif due <= now:
+            return
+        lap = self.lapses(key)
+        if due - now <= (1 - EARLY_REVIEW) * interval_for(lvl, lap):
             lvl = min(MAX_LEVEL, lvl + 1)
-            lap = self.lapses(key)
             if lap and lvl >= FORGIVE_FROM_LEVEL:
                 lap -= 1
             self._set(key, lvl, now + interval_for(lvl, lap), lap)
@@ -881,6 +887,20 @@ class Progress:
             if next_due is None or c[1] < next_due:
                 next_due = c[1]
         return ("due" if next_due <= now else "learned"), next_due, min_lvl
+
+
+def spread_by_chapter(lines):
+    """Reorder lines round-robin across chapters so lines that share most of their moves
+    are not played back to back. Order inside each chapter is kept."""
+    groups = {}
+    for l in lines:
+        groups.setdefault(id(l.chapter), []).append(l)
+    out, queues = [], list(groups.values())
+    while queues:
+        for q in queues:
+            out.append(q.pop(0))
+        queues = [q for q in queues if q]
+    return out
 
 
 def short(text, n):
@@ -2119,7 +2139,8 @@ class TrainerApp:
 
     def start_review(self):
         if self.course:
-            self.start_session("review", [l for l in self.course.lines if self.statuses[l.index][0] == "due"])
+            due = [l for l in self.course.lines if self.statuses[l.index][0] == "due"]
+            self.start_session("review", spread_by_chapter(due))
 
     def start_drill(self):
         if self.course:
@@ -2151,12 +2172,29 @@ class TrainerApp:
         return None
 
     def _next_course_line(self, line):
-        """The next line after `line` in course order that has moves for you."""
+        """Where "Next" goes once the session is used up. Drill walks the course in order.
+        Learn and review go to the next line that still needs work: a due line first,
+        otherwise a new one (searching on from `line`, wrapping around), so finished
+        lines are not replayed over and over."""
         if self.course is None or line is None:
             return None
-        for l in self.course.lines[line.index + 1:]:
-            if l.keys:
-                return l
+        lines = self.course.lines
+        after = lines[line.index + 1:]
+        s = self.session
+        if s is not None and s.mode == "drill":
+            return next((l for l in after if l.keys), None)
+        now = time.time()
+        order = after + lines[:line.index + 1]
+        status = {}
+        for want in ("due", "new"):
+            for l in order:
+                if l is line or not l.keys:
+                    continue
+                st = status.get(l.index)
+                if st is None:
+                    st = status[l.index] = self.progress.line_status(l, now)[0]
+                if st == want:
+                    return l
         return None
 
     def load_session_line(self):
@@ -2424,14 +2462,16 @@ class TrainerApp:
             where = "Next in this session"
         else:
             nxt = self._next_course_line(self.line)
-            where = "Next in the course"
+            where = "Up next"
         if nxt is not None:
             self.done_next_btn.set_kind("primary")
             self.done_label.config(text=f"{where}: {short(nxt.chapter.title(), 40)}"
                                         + ("" if nxt.is_main else f"  ({short(nxt.label, 30)})"))
         else:
             self.done_next_btn.set_kind("primary", enabled=False)
-            self.done_label.config(text="That was the last line in this course.")
+            self.done_label.config(text="That was the last line in this course."
+                                   if self.session.mode == "drill" else
+                                   "Nothing else is due or new right now.")
         self.done_bar.pack(fill="x", pady=(12, 0), after=self.banner.master)
         self.notation_hint.config(text="Click any move to view it")
 
